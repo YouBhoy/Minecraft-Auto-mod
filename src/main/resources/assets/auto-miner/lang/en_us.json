@@ -1,0 +1,7 @@
+{
+  "category.autominer": "Auto Miner",
+  "key.autominer.pos1": "Set Position 1",
+  "key.autominer.pos2": "Set Position 2",
+  "key.autominer.toggle": "Start/Stop Mining",
+  "key.autominer.clear": "Clear Selection"
+}

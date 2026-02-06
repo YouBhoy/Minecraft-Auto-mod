@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "auto-miner",
+  "version": "${version}",
+  "name": "Auto Miner",
+  "description": "Automated mining within a defined 3D area with pathfinding and tool switching",
+  "authors": ["You"],
+  "contact": {},
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.autominer.AutoMinerClient"]
+  },
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "minecraft": "~${minecraft_version}",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
