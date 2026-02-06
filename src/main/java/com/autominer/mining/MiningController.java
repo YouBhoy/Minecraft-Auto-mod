@@ -7,6 +7,8 @@ import net.minecraft.client.network.ClientPlayerInteractionManager;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
@@ -21,6 +23,7 @@ public class MiningController {
         IDLE,
         MOVING,
         ROTATING,
+        VERIFYING,
         BREAKING,
         WAITING
     }
@@ -43,11 +46,19 @@ public class MiningController {
     private float targetYaw = 0;
     private float targetPitch = 0;
     
+    // Movement tracking
+    private int stuckTicks = 0;
+    private Vec3d lastPosition = null;
+    
+    // Verification
+    private int verifyTicks = 0;
+    
     // Constants
-    private static final double REACH_DISTANCE = 4.5;
-    private static final float ROTATION_SPEED = 15.0f;
+    private static final double REACH_DISTANCE = 4.0;
+    private static final float ROTATION_SPEED = 12.0f;
     private static final int MIN_DELAY_TICKS = 2;
     private static final int MAX_DELAY_TICKS = 5;
+    private static final int STUCK_THRESHOLD = 10;
     
     public void start(BlockPos pos1, BlockPos pos2) {
         blocksToMine.clear();
@@ -70,6 +81,8 @@ public class MiningController {
         }
         
         state = State.IDLE;
+        stuckTicks = 0;
+        lastPosition = null;
         findNextBlock(MinecraftClient.getInstance());
     }
     
@@ -80,6 +93,8 @@ public class MiningController {
         currentTarget = null;
         breakingBlock = null;
         breakingProgress = 0;
+        stuckTicks = 0;
+        lastPosition = null;
         
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.interactionManager != null) {
@@ -109,6 +124,9 @@ public class MiningController {
             case ROTATING:
                 handleRotating(client);
                 break;
+            case VERIFYING:
+                handleVerifying(client);
+                break;
             case BREAKING:
                 handleBreaking(client);
                 break;
@@ -127,6 +145,7 @@ public class MiningController {
             if (!blockState.isAir() && blockState.getHardness(client.world, pos) >= 0) {
                 currentTarget = pos;
                 state = State.MOVING;
+                stuckTicks = 0;
                 return;
             }
             currentBlockIndex++;
@@ -148,27 +167,96 @@ public class MiningController {
         Vec3d targetCenter = Vec3d.ofCenter(currentTarget);
         double distance = playerPos.distanceTo(targetCenter);
         
-        if (distance <= REACH_DISTANCE) {
-            // Close enough, start rotating
+        // Check if close enough to mine
+        if (distance <= REACH_DISTANCE && canSeeBlock(client, currentTarget)) {
+            // Close enough and can see target, start rotating
             state = State.ROTATING;
             calculateTargetRotation(client);
+            stuckTicks = 0;
             return;
         }
+        
+        // Stuck detection
+        if (lastPosition != null) {
+            double moved = playerPos.distanceTo(lastPosition);
+            if (moved < 0.01) {
+                stuckTicks++;
+            } else {
+                stuckTicks = 0;
+            }
+        }
+        lastPosition = playerPos;
         
         // Need to move closer - calculate direction
         double dx = targetCenter.x - playerPos.x;
         double dz = targetCenter.z - playerPos.z;
         float yaw = (float) (Math.atan2(-dx, dz) * 180.0 / Math.PI);
         
-        // Set player movement
+        // Set player yaw for movement direction
         player.setYaw(yaw);
         player.setSprinting(false);
         
-        // Simulate forward movement by setting velocity
-        double speed = 0.15;
+        // Check if we need to jump
+        boolean shouldJump = shouldJump(client, player, yaw);
+        
+        // Simulate forward movement
+        double speed = 0.13;
         double motionX = -Math.sin(Math.toRadians(yaw)) * speed;
         double motionZ = Math.cos(Math.toRadians(yaw)) * speed;
-        player.setVelocity(motionX, player.getVelocity().y, motionZ);
+        
+        // Apply jump if needed
+        double motionY = player.getVelocity().y;
+        if (shouldJump && player.isOnGround()) {
+            motionY = 0.42; // Standard jump velocity
+        }
+        
+        player.setVelocity(motionX, motionY, motionZ);
+        
+        // If stuck for too long, try jumping or skip block
+        if (stuckTicks > STUCK_THRESHOLD * 3) {
+            // Skip this block - can't reach it
+            currentBlockIndex++;
+            state = State.IDLE;
+            stuckTicks = 0;
+        }
+    }
+    
+    private boolean shouldJump(MinecraftClient client, ClientPlayerEntity player, float yaw) {
+        // Check block in front of player at feet and head level
+        double checkDist = 0.8;
+        double frontX = player.getX() - Math.sin(Math.toRadians(yaw)) * checkDist;
+        double frontZ = player.getZ() + Math.cos(Math.toRadians(yaw)) * checkDist;
+        
+        BlockPos feetPos = new BlockPos((int) Math.floor(frontX), (int) Math.floor(player.getY()), (int) Math.floor(frontZ));
+        BlockPos headPos = feetPos.up();
+        
+        ClientWorld world = client.world;
+        BlockState feetBlock = world.getBlockState(feetPos);
+        BlockState headBlock = world.getBlockState(headPos);
+        BlockState aboveHeadBlock = world.getBlockState(headPos.up());
+        
+        // Jump if there's a solid block at feet level but space above
+        boolean blockAtFeet = !feetBlock.isAir() && feetBlock.isSolidBlock(world, feetPos);
+        boolean spaceAbove = headBlock.isAir() || !headBlock.isSolidBlock(world, headPos);
+        boolean spaceAboveHead = aboveHeadBlock.isAir() || !aboveHeadBlock.isSolidBlock(world, headPos.up());
+        
+        // Also jump if target is above us
+        boolean targetAbove = currentTarget != null && currentTarget.getY() > player.getY() + 0.5;
+        
+        // Also jump if stuck
+        boolean isStuck = stuckTicks > STUCK_THRESHOLD;
+        
+        return (blockAtFeet && spaceAbove && spaceAboveHead) || (targetAbove && isStuck) || (isStuck && player.isOnGround());
+    }
+    
+    private boolean canSeeBlock(MinecraftClient client, BlockPos target) {
+        // Check if there's line of sight to the block
+        Vec3d eyePos = client.player.getEyePos();
+        Vec3d targetCenter = Vec3d.ofCenter(target);
+        
+        // Simple distance check - more sophisticated raycast could be added
+        double dist = eyePos.distanceTo(targetCenter);
+        return dist <= REACH_DISTANCE + 0.5;
     }
     
     private void handleRotating(MinecraftClient client) {
@@ -180,6 +268,9 @@ public class MiningController {
         ClientPlayerEntity player = client.player;
         float currentYaw = player.getYaw();
         float currentPitch = player.getPitch();
+        
+        // Recalculate target rotation each tick for accuracy
+        calculateTargetRotation(client);
         
         // Calculate rotation delta
         float yawDiff = targetYaw - currentYaw;
@@ -193,13 +284,13 @@ public class MiningController {
         float newYaw = currentYaw;
         float newPitch = currentPitch;
         
-        if (Math.abs(yawDiff) > 1.0f) {
+        if (Math.abs(yawDiff) > 0.5f) {
             newYaw = currentYaw + Math.signum(yawDiff) * Math.min(Math.abs(yawDiff), ROTATION_SPEED);
         } else {
             newYaw = targetYaw;
         }
         
-        if (Math.abs(pitchDiff) > 1.0f) {
+        if (Math.abs(pitchDiff) > 0.5f) {
             newPitch = currentPitch + Math.signum(pitchDiff) * Math.min(Math.abs(pitchDiff), ROTATION_SPEED);
         } else {
             newPitch = targetPitch;
@@ -210,10 +301,40 @@ public class MiningController {
         
         // Check if rotation is complete
         if (Math.abs(targetYaw - newYaw) <= 1.0f && Math.abs(targetPitch - newPitch) <= 1.0f) {
-            state = State.BREAKING;
-            breakingProgress = 0;
-            breakingBlock = currentTarget;
+            // Add verification state to ensure we're looking at the right block
+            state = State.VERIFYING;
+            verifyTicks = 2; // Wait 2 ticks before breaking
         }
+    }
+    
+    private void handleVerifying(MinecraftClient client) {
+        verifyTicks--;
+        
+        if (verifyTicks > 0) {
+            // Keep updating rotation while verifying
+            calculateTargetRotation(client);
+            client.player.setYaw(targetYaw);
+            client.player.setPitch(targetPitch);
+            return;
+        }
+        
+        // Verify we're looking at the correct block
+        if (client.crosshairTarget != null && client.crosshairTarget.getType() == HitResult.Type.BLOCK) {
+            BlockHitResult hitResult = (BlockHitResult) client.crosshairTarget;
+            BlockPos lookingAt = hitResult.getBlockPos();
+            
+            if (lookingAt.equals(currentTarget)) {
+                // Correct block - start breaking
+                state = State.BREAKING;
+                breakingProgress = 0;
+                breakingBlock = currentTarget;
+                return;
+            }
+        }
+        
+        // Not looking at correct block - recalculate and try again
+        calculateTargetRotation(client);
+        state = State.ROTATING;
     }
     
     private void handleBreaking(MinecraftClient client) {
@@ -233,20 +354,30 @@ public class MiningController {
             return;
         }
         
-        // Select best tool
-        selectBestTool(client, blockState);
-        
-        // Start or continue breaking
-        ClientPlayerInteractionManager im = client.interactionManager;
-        
-        if (breakingBlock == null || !breakingBlock.equals(currentTarget)) {
-            breakingBlock = currentTarget;
-            breakingProgress = 0;
+        // IMPORTANT: Verify we're still looking at the correct block before mining
+        if (client.crosshairTarget != null && client.crosshairTarget.getType() == HitResult.Type.BLOCK) {
+            BlockHitResult hitResult = (BlockHitResult) client.crosshairTarget;
+            BlockPos lookingAt = hitResult.getBlockPos();
+            
+            if (!lookingAt.equals(currentTarget)) {
+                // Wrong block! Go back to rotating
+                state = State.ROTATING;
+                calculateTargetRotation(client);
+                return;
+            }
+            
+            // Select best tool
+            selectBestTool(client, blockState);
+            
+            // Break the block we're actually looking at
+            ClientPlayerInteractionManager im = client.interactionManager;
+            im.updateBlockBreakingProgress(lookingAt, hitResult.getSide());
+            client.player.swingHand(Hand.MAIN_HAND);
+        } else {
+            // Not looking at any block - go back to rotating
+            state = State.ROTATING;
+            calculateTargetRotation(client);
         }
-        
-        // Attack the block
-        im.updateBlockBreakingProgress(currentTarget, Direction.UP);
-        client.player.swingHand(Hand.MAIN_HAND);
     }
     
     private void handleWaiting(MinecraftClient client) {
@@ -270,6 +401,9 @@ public class MiningController {
         
         targetYaw = (float) (Math.atan2(-dx, dz) * 180.0 / Math.PI);
         targetPitch = (float) (Math.atan2(-dy, horizontalDist) * 180.0 / Math.PI);
+        
+        // Clamp pitch to valid range
+        targetPitch = Math.max(-90.0f, Math.min(90.0f, targetPitch));
     }
     
     private void selectBestTool(MinecraftClient client, BlockState blockState) {
