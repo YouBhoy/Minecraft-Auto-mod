@@ -35,6 +35,10 @@ public class MiningController {
     // Start position for linear mining
     private BlockPos startPos = null;
     
+    // Perimeter bounds for checking blocking blocks
+    private int perimeterMinX, perimeterMinY, perimeterMinZ;
+    private int perimeterMaxX, perimeterMaxY, perimeterMaxZ;
+    
     // Timing for anti-cheat
     private long lastActionTime = 0;
     private int waitTicks = 0;
@@ -75,53 +79,67 @@ public class MiningController {
         int maxY = Math.max(pos1.getY(), pos2.getY());
         int maxZ = Math.max(pos1.getZ(), pos2.getZ());
         
-        // Determine if pos1 is at min or max for each axis to set direction
-        boolean xForward = pos1.getX() <= pos2.getX();
-        boolean yDown = pos1.getY() >= pos2.getY(); // Usually mine top to bottom
-        boolean zForward = pos1.getZ() <= pos2.getZ();
+        // Store perimeter bounds for blocking block checks
+        perimeterMinX = minX;
+        perimeterMinY = minY;
+        perimeterMinZ = minZ;
+        perimeterMaxX = maxX;
+        perimeterMaxY = maxY;
+        perimeterMaxZ = maxZ;
         
-        // LINEAR SNAKE PATTERN: Mine layer by layer, row by row, in a consistent pattern
-        // Start from pos1's Y level and work towards pos2's Y level
-        int yStart = pos1.getY();
-        int yEnd = pos2.getY();
-        int yStep = yDown ? -1 : 1;
+        // VERTICAL SLICE PATTERN: Mine column by column, standing in front of each slice
+        // Determine the primary direction (which axis has the most distance from pos1 to pos2)
+        int xDist = Math.abs(pos2.getX() - pos1.getX());
+        int zDist = Math.abs(pos2.getZ() - pos1.getZ());
         
-        for (int y = yStart; yDown ? (y >= yEnd) : (y <= yEnd); y += yStep) {
-            // Determine X direction based on current layer (snake pattern)
-            int layerIndex = Math.abs(y - yStart);
-            boolean reverseX = (layerIndex % 2 == 1);
+        // Primary axis is the one we walk along, secondary is the width of each slice
+        boolean walkAlongZ = zDist >= xDist;
+        
+        if (walkAlongZ) {
+            // Walk along Z axis, mine X columns at each Z position
+            boolean zForward = pos1.getZ() <= pos2.getZ();
+            int zStart = pos1.getZ();
+            int zEnd = pos2.getZ();
+            int zStep = zForward ? 1 : -1;
             
-            int xStart = xForward ? minX : maxX;
-            int xEnd = xForward ? maxX : minX;
+            int sliceIndex = 0;
+            for (int z = zStart; zForward ? (z <= zEnd) : (z >= zEnd); z += zStep) {
+                // Alternate X direction for snake pattern
+                boolean reverseX = (sliceIndex % 2 == 1);
+                int xStart = reverseX ? maxX : minX;
+                int xEnd = reverseX ? minX : maxX;
+                int xStep = reverseX ? -1 : 1;
+                
+                for (int x = xStart; reverseX ? (x >= xEnd) : (x <= xEnd); x += xStep) {
+                    // Mine from top to bottom at each (x, z) position
+                    for (int y = maxY; y >= minY; y--) {
+                        blocksToMine.add(new BlockPos(x, y, z));
+                    }
+                }
+                sliceIndex++;
+            }
+        } else {
+            // Walk along X axis, mine Z columns at each X position
+            boolean xForward = pos1.getX() <= pos2.getX();
+            int xStart = pos1.getX();
+            int xEnd = pos2.getX();
             int xStep = xForward ? 1 : -1;
             
-            // Reverse X direction for snake pattern on alternating layers
-            if (reverseX) {
-                xStart = xForward ? maxX : minX;
-                xEnd = xForward ? minX : maxX;
-                xStep = -xStep;
-            }
-            
-            int rowIndex = 0;
-            for (int x = xStart; xForward != reverseX ? (x <= xEnd) : (x >= xEnd); x += xStep) {
-                // Determine Z direction based on current row (snake pattern within layer)
-                boolean reverseZ = (rowIndex % 2 == 1);
+            int sliceIndex = 0;
+            for (int x = xStart; xForward ? (x <= xEnd) : (x >= xEnd); x += xStep) {
+                // Alternate Z direction for snake pattern
+                boolean reverseZ = (sliceIndex % 2 == 1);
+                int zStart = reverseZ ? maxZ : minZ;
+                int zEnd = reverseZ ? minZ : maxZ;
+                int zStep = reverseZ ? -1 : 1;
                 
-                int zStart = zForward ? minZ : maxZ;
-                int zEnd = zForward ? maxZ : minZ;
-                int zStep = zForward ? 1 : -1;
-                
-                // Reverse Z direction for snake pattern on alternating rows
-                if (reverseZ) {
-                    zStart = zForward ? maxZ : minZ;
-                    zEnd = zForward ? minZ : maxZ;
-                    zStep = -zStep;
+                for (int z = zStart; reverseZ ? (z >= zEnd) : (z <= zEnd); z += zStep) {
+                    // Mine from top to bottom at each (x, z) position
+                    for (int y = maxY; y >= minY; y--) {
+                        blocksToMine.add(new BlockPos(x, y, z));
+                    }
                 }
-                
-                for (int z = zStart; zForward != reverseZ ? (z <= zEnd) : (z >= zEnd); z += zStep) {
-                    blocksToMine.add(new BlockPos(x, y, z));
-                }
-                rowIndex++;
+                sliceIndex++;
             }
         }
         
@@ -212,7 +230,29 @@ public class MiningController {
         Vec3d targetCenter = Vec3d.ofCenter(currentTarget);
         double distance = playerPos.distanceTo(targetCenter);
         
-        // Check if close enough to mine
+        // Calculate direction to target
+        double dx = targetCenter.x - playerPos.x;
+        double dz = targetCenter.z - playerPos.z;
+        float yaw = (float) (Math.atan2(-dx, dz) * 180.0 / Math.PI);
+        
+        // Check for blocking blocks in front that are within the perimeter - mine those first!
+        BlockPos blockingBlock = findBlockingBlockInPerimeter(client, player, yaw);
+        if (blockingBlock != null) {
+            // There's a block in the way that's in our mining area - mine it first!
+            Vec3d blockCenter = Vec3d.ofCenter(blockingBlock);
+            double blockDist = player.getEyePos().distanceTo(blockCenter);
+            
+            if (blockDist <= REACH_DISTANCE) {
+                // Can reach it - mine it
+                currentTarget = blockingBlock;
+                state = State.ROTATING;
+                calculateTargetRotation(client);
+                stuckTicks = 0;
+                return;
+            }
+        }
+        
+        // Check if close enough to mine the actual target
         if (distance <= REACH_DISTANCE && canSeeBlock(client, currentTarget)) {
             // Close enough and can see target, start rotating
             state = State.ROTATING;
@@ -231,11 +271,6 @@ public class MiningController {
             }
         }
         lastPosition = playerPos;
-        
-        // Need to move closer - calculate direction
-        double dx = targetCenter.x - playerPos.x;
-        double dz = targetCenter.z - playerPos.z;
-        float yaw = (float) (Math.atan2(-dx, dz) * 180.0 / Math.PI);
         
         // Set player yaw for movement direction
         player.setYaw(yaw);
@@ -264,6 +299,41 @@ public class MiningController {
             state = State.IDLE;
             stuckTicks = 0;
         }
+    }
+    
+    private BlockPos findBlockingBlockInPerimeter(MinecraftClient client, ClientPlayerEntity player, float yaw) {
+        // Check blocks in front of the player at various heights
+        ClientWorld world = client.world;
+        
+        for (double dist = 0.5; dist <= 2.0; dist += 0.5) {
+            double frontX = player.getX() - Math.sin(Math.toRadians(yaw)) * dist;
+            double frontZ = player.getZ() + Math.cos(Math.toRadians(yaw)) * dist;
+            
+            // Check at feet, body, and head level
+            for (int yOffset = 0; yOffset <= 2; yOffset++) {
+                BlockPos checkPos = new BlockPos(
+                    (int) Math.floor(frontX), 
+                    (int) Math.floor(player.getY()) + yOffset, 
+                    (int) Math.floor(frontZ)
+                );
+                
+                // Is this block within the perimeter?
+                if (isInPerimeter(checkPos)) {
+                    BlockState blockState = world.getBlockState(checkPos);
+                    // Is it a solid block we can mine?
+                    if (!blockState.isAir() && blockState.getHardness(world, checkPos) >= 0) {
+                        return checkPos;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+    
+    private boolean isInPerimeter(BlockPos pos) {
+        return pos.getX() >= perimeterMinX && pos.getX() <= perimeterMaxX &&
+               pos.getY() >= perimeterMinY && pos.getY() <= perimeterMaxY &&
+               pos.getZ() >= perimeterMinZ && pos.getZ() <= perimeterMaxZ;
     }
     
     private boolean shouldJump(MinecraftClient client, ClientPlayerEntity player, float yaw) {
