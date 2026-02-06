@@ -23,7 +23,6 @@ public class MiningController {
         IDLE,
         MOVING,
         ROTATING,
-        VERIFYING,
         BREAKING,
         WAITING
     }
@@ -32,6 +31,9 @@ public class MiningController {
     private List<BlockPos> blocksToMine = new ArrayList<>();
     private int currentBlockIndex = 0;
     private BlockPos currentTarget = null;
+    
+    // Start position for linear mining
+    private BlockPos startPos = null;
     
     // Timing for anti-cheat
     private long lastActionTime = 0;
@@ -45,24 +47,26 @@ public class MiningController {
     // Rotation tracking
     private float targetYaw = 0;
     private float targetPitch = 0;
+    private int rotationTicks = 0;
     
     // Movement tracking
     private int stuckTicks = 0;
     private Vec3d lastPosition = null;
     
-    // Verification
-    private int verifyTicks = 0;
-    
     // Constants
-    private static final double REACH_DISTANCE = 4.0;
-    private static final float ROTATION_SPEED = 12.0f;
-    private static final int MIN_DELAY_TICKS = 2;
-    private static final int MAX_DELAY_TICKS = 5;
+    private static final double REACH_DISTANCE = 4.5;
+    private static final float ROTATION_SPEED = 15.0f;
+    private static final int MIN_DELAY_TICKS = 1;
+    private static final int MAX_DELAY_TICKS = 3;
     private static final int STUCK_THRESHOLD = 10;
+    private static final int ROTATION_SETTLE_TICKS = 3;
     
     public void start(BlockPos pos1, BlockPos pos2) {
         blocksToMine.clear();
         currentBlockIndex = 0;
+        
+        // Store start position - mining will proceed FROM pos1 TOWARDS pos2
+        startPos = pos1;
         
         int minX = Math.min(pos1.getX(), pos2.getX());
         int minY = Math.min(pos1.getY(), pos2.getY());
@@ -71,18 +75,60 @@ public class MiningController {
         int maxY = Math.max(pos1.getY(), pos2.getY());
         int maxZ = Math.max(pos1.getZ(), pos2.getZ());
         
-        // Add blocks from top to bottom (safer for mining)
-        for (int y = maxY; y >= minY; y--) {
-            for (int x = minX; x <= maxX; x++) {
-                for (int z = minZ; z <= maxZ; z++) {
+        // Determine if pos1 is at min or max for each axis to set direction
+        boolean xForward = pos1.getX() <= pos2.getX();
+        boolean yDown = pos1.getY() >= pos2.getY(); // Usually mine top to bottom
+        boolean zForward = pos1.getZ() <= pos2.getZ();
+        
+        // LINEAR SNAKE PATTERN: Mine layer by layer, row by row, in a consistent pattern
+        // Start from pos1's Y level and work towards pos2's Y level
+        int yStart = pos1.getY();
+        int yEnd = pos2.getY();
+        int yStep = yDown ? -1 : 1;
+        
+        for (int y = yStart; yDown ? (y >= yEnd) : (y <= yEnd); y += yStep) {
+            // Determine X direction based on current layer (snake pattern)
+            int layerIndex = Math.abs(y - yStart);
+            boolean reverseX = (layerIndex % 2 == 1);
+            
+            int xStart = xForward ? minX : maxX;
+            int xEnd = xForward ? maxX : minX;
+            int xStep = xForward ? 1 : -1;
+            
+            // Reverse X direction for snake pattern on alternating layers
+            if (reverseX) {
+                xStart = xForward ? maxX : minX;
+                xEnd = xForward ? minX : maxX;
+                xStep = -xStep;
+            }
+            
+            int rowIndex = 0;
+            for (int x = xStart; xForward != reverseX ? (x <= xEnd) : (x >= xEnd); x += xStep) {
+                // Determine Z direction based on current row (snake pattern within layer)
+                boolean reverseZ = (rowIndex % 2 == 1);
+                
+                int zStart = zForward ? minZ : maxZ;
+                int zEnd = zForward ? maxZ : minZ;
+                int zStep = zForward ? 1 : -1;
+                
+                // Reverse Z direction for snake pattern on alternating rows
+                if (reverseZ) {
+                    zStart = zForward ? maxZ : minZ;
+                    zEnd = zForward ? minZ : maxZ;
+                    zStep = -zStep;
+                }
+                
+                for (int z = zStart; zForward != reverseZ ? (z <= zEnd) : (z >= zEnd); z += zStep) {
                     blocksToMine.add(new BlockPos(x, y, z));
                 }
+                rowIndex++;
             }
         }
         
         state = State.IDLE;
         stuckTicks = 0;
         lastPosition = null;
+        rotationTicks = 0;
         findNextBlock(MinecraftClient.getInstance());
     }
     
@@ -95,6 +141,8 @@ public class MiningController {
         breakingProgress = 0;
         stuckTicks = 0;
         lastPosition = null;
+        rotationTicks = 0;
+        startPos = null;
         
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.interactionManager != null) {
@@ -123,9 +171,6 @@ public class MiningController {
                 break;
             case ROTATING:
                 handleRotating(client);
-                break;
-            case VERIFYING:
-                handleVerifying(client);
                 break;
             case BREAKING:
                 handleBreaking(client);
@@ -299,42 +344,19 @@ public class MiningController {
         player.setYaw(newYaw);
         player.setPitch(newPitch);
         
-        // Check if rotation is complete
-        if (Math.abs(targetYaw - newYaw) <= 1.0f && Math.abs(targetPitch - newPitch) <= 1.0f) {
-            // Add verification state to ensure we're looking at the right block
-            state = State.VERIFYING;
-            verifyTicks = 2; // Wait 2 ticks before breaking
-        }
-    }
-    
-    private void handleVerifying(MinecraftClient client) {
-        verifyTicks--;
-        
-        if (verifyTicks > 0) {
-            // Keep updating rotation while verifying
-            calculateTargetRotation(client);
-            client.player.setYaw(targetYaw);
-            client.player.setPitch(targetPitch);
-            return;
-        }
-        
-        // Verify we're looking at the correct block
-        if (client.crosshairTarget != null && client.crosshairTarget.getType() == HitResult.Type.BLOCK) {
-            BlockHitResult hitResult = (BlockHitResult) client.crosshairTarget;
-            BlockPos lookingAt = hitResult.getBlockPos();
-            
-            if (lookingAt.equals(currentTarget)) {
-                // Correct block - start breaking
+        // Check if rotation is complete (close enough)
+        if (Math.abs(targetYaw - newYaw) <= 2.0f && Math.abs(targetPitch - newPitch) <= 2.0f) {
+            rotationTicks++;
+            // Wait a few ticks for rotation to settle before mining
+            if (rotationTicks >= ROTATION_SETTLE_TICKS) {
                 state = State.BREAKING;
                 breakingProgress = 0;
                 breakingBlock = currentTarget;
-                return;
+                rotationTicks = 0;
             }
+        } else {
+            rotationTicks = 0;
         }
-        
-        // Not looking at correct block - recalculate and try again
-        calculateTargetRotation(client);
-        state = State.ROTATING;
     }
     
     private void handleBreaking(MinecraftClient client) {
@@ -354,30 +376,21 @@ public class MiningController {
             return;
         }
         
-        // IMPORTANT: Verify we're still looking at the correct block before mining
-        if (client.crosshairTarget != null && client.crosshairTarget.getType() == HitResult.Type.BLOCK) {
-            BlockHitResult hitResult = (BlockHitResult) client.crosshairTarget;
-            BlockPos lookingAt = hitResult.getBlockPos();
-            
-            if (!lookingAt.equals(currentTarget)) {
-                // Wrong block! Go back to rotating
-                state = State.ROTATING;
-                calculateTargetRotation(client);
-                return;
-            }
-            
-            // Select best tool
-            selectBestTool(client, blockState);
-            
-            // Break the block we're actually looking at
-            ClientPlayerInteractionManager im = client.interactionManager;
-            im.updateBlockBreakingProgress(lookingAt, hitResult.getSide());
-            client.player.swingHand(Hand.MAIN_HAND);
-        } else {
-            // Not looking at any block - go back to rotating
-            state = State.ROTATING;
-            calculateTargetRotation(client);
-        }
+        // Keep looking at the target block while breaking
+        calculateTargetRotation(client);
+        client.player.setYaw(targetYaw);
+        client.player.setPitch(targetPitch);
+        
+        // Select best tool
+        selectBestTool(client, blockState);
+        
+        // Find the best face to mine from
+        Direction face = getBlockFace(client, currentTarget);
+        
+        // Mine the target block directly (don't rely on crosshairTarget)
+        ClientPlayerInteractionManager im = client.interactionManager;
+        im.updateBlockBreakingProgress(currentTarget, face);
+        client.player.swingHand(Hand.MAIN_HAND);
     }
     
     private void handleWaiting(MinecraftClient client) {
@@ -404,6 +417,29 @@ public class MiningController {
         
         // Clamp pitch to valid range
         targetPitch = Math.max(-90.0f, Math.min(90.0f, targetPitch));
+    }
+    
+    private Direction getBlockFace(MinecraftClient client, BlockPos target) {
+        // Calculate which face of the block is closest to the player
+        Vec3d playerPos = client.player.getEyePos();
+        Vec3d blockCenter = Vec3d.ofCenter(target);
+        
+        double dx = playerPos.x - blockCenter.x;
+        double dy = playerPos.y - blockCenter.y;
+        double dz = playerPos.z - blockCenter.z;
+        
+        double absX = Math.abs(dx);
+        double absY = Math.abs(dy);
+        double absZ = Math.abs(dz);
+        
+        // Return the face that points most towards the player
+        if (absY >= absX && absY >= absZ) {
+            return dy > 0 ? Direction.UP : Direction.DOWN;
+        } else if (absX >= absZ) {
+            return dx > 0 ? Direction.EAST : Direction.WEST;
+        } else {
+            return dz > 0 ? Direction.SOUTH : Direction.NORTH;
+        }
     }
     
     private void selectBestTool(MinecraftClient client, BlockState blockState) {
