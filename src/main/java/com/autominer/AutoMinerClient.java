@@ -1,5 +1,6 @@
 package com.autominer;
 
+import com.autominer.combat.CombatController;
 import com.autominer.mining.MiningController;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -24,6 +25,7 @@ public class AutoMinerClient implements ClientModInitializer {
     private static KeyBinding keyToggle;
     private static KeyBinding keyClear;
     private static KeyBinding keyReachToggle;
+    private static KeyBinding keyCombatToggle;
     
     // Selection positions
     public static BlockPos pos1 = null;
@@ -31,6 +33,9 @@ public class AutoMinerClient implements ClientModInitializer {
     
     // Mining controller
     public static MiningController miningController;
+    
+    // Combat controller
+    public static CombatController combatController;
 
     private static boolean extendedReachEnabled = false;
     
@@ -72,9 +77,19 @@ public class AutoMinerClient implements ClientModInitializer {
             Category.GAMEPLAY
         ));
         
+        keyCombatToggle = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+            "key.autominer.combat_toggle",
+            InputUtil.Type.KEYSYM,
+            GLFW.GLFW_KEY_K,
+            Category.GAMEPLAY
+        ));
+        
         // Initialize mining controller
         miningController = new MiningController();
         miningController.setExtendedReach(extendedReachEnabled);
+        
+        // Initialize combat controller
+        combatController = new CombatController();
         
         // Register tick event
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
@@ -103,6 +118,13 @@ public class AutoMinerClient implements ClientModInitializer {
         while (keyReachToggle.wasPressed()) {
             toggleReach(client);
         }
+        
+        while (keyCombatToggle.wasPressed()) {
+            toggleCombat(client);
+        }
+        
+        // Tick the combat controller first (for protection)
+        combatController.tick(client, miningController.isMining());
         
         // Tick the mining controller
         miningController.tick(client);
@@ -156,6 +178,13 @@ public class AutoMinerClient implements ClientModInitializer {
         miningController.setExtendedReach(extendedReachEnabled);
         String label = extendedReachEnabled ? "Extended" : "Vanilla";
         showActionBarMessage(client, "§bReach: " + label + " (" + miningController.getReachDistance() + ")");
+    }
+    
+    private void toggleCombat(MinecraftClient client) {
+        boolean newState = !combatController.isEnabled();
+        combatController.setEnabled(newState);
+        String status = newState ? "§aEnabled" : "§cDisabled";
+        showActionBarMessage(client, "§eCombat: " + status);
     }
     
     private BlockPos getLookedAtBlock(MinecraftClient client) {
