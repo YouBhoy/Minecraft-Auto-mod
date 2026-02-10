@@ -23,6 +23,7 @@ public class AutoMinerClient implements ClientModInitializer {
     private static KeyBinding keyPos2;
     private static KeyBinding keyToggle;
     private static KeyBinding keyClear;
+    private static KeyBinding keyReachToggle;
     
     // Selection positions
     public static BlockPos pos1 = null;
@@ -30,6 +31,8 @@ public class AutoMinerClient implements ClientModInitializer {
     
     // Mining controller
     public static MiningController miningController;
+
+    private static boolean extendedReachEnabled = false;
     
     @Override
     public void onInitializeClient() {
@@ -61,9 +64,17 @@ public class AutoMinerClient implements ClientModInitializer {
             GLFW.GLFW_KEY_H,
             Category.GAMEPLAY
         ));
+
+        keyReachToggle = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+            "key.autominer.reach_toggle",
+            InputUtil.Type.KEYSYM,
+            GLFW.GLFW_KEY_J,
+            Category.GAMEPLAY
+        ));
         
         // Initialize mining controller
         miningController = new MiningController();
+        miningController.setExtendedReach(extendedReachEnabled);
         
         // Register tick event
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
@@ -87,6 +98,10 @@ public class AutoMinerClient implements ClientModInitializer {
         
         while (keyClear.wasPressed()) {
             clearSelection(client);
+        }
+
+        while (keyReachToggle.wasPressed()) {
+            toggleReach(client);
         }
         
         // Tick the mining controller
@@ -134,6 +149,13 @@ public class AutoMinerClient implements ClientModInitializer {
         pos2 = null;
         miningController.stop();
         showActionBarMessage(client, "§eSelection cleared");
+    }
+
+    private void toggleReach(MinecraftClient client) {
+        extendedReachEnabled = !extendedReachEnabled;
+        miningController.setExtendedReach(extendedReachEnabled);
+        String label = extendedReachEnabled ? "Extended" : "Vanilla";
+        showActionBarMessage(client, "§bReach: " + label + " (" + miningController.getReachDistance() + ")");
     }
     
     private BlockPos getLookedAtBlock(MinecraftClient client) {

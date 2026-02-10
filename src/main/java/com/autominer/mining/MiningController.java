@@ -38,6 +38,8 @@ public class MiningController {
     
     private State state = State.IDLE;
     private List<BlockPos> blocksToMine = new ArrayList<>();
+    private List<BlockPos> deferredBlocks = new ArrayList<>();
+    private boolean miningDeferredBlocks = false;
     private int currentBlockIndex = 0;
     private BlockPos currentTarget = null;      // The block we're currently mining
     private BlockPos queueTarget = null;        // The target from the mining queue
@@ -89,7 +91,8 @@ public class MiningController {
     );
     
     // Constants
-    private static final double REACH_DISTANCE = 4.5;
+    private static final double VANILLA_REACH_DISTANCE = 4.5;
+    private static final double EXTENDED_REACH_DISTANCE = 15.0;
     private static final float ROTATION_SPEED = 25.0f;  // Faster rotation
     private static final int MIN_DELAY_TICKS = 0;
     private static final int MAX_DELAY_TICKS = 1;
@@ -97,9 +100,13 @@ public class MiningController {
     private static final int ROTATION_SETTLE_TICKS = 1;  // Reduced from 3
     private static final int MAX_PILLAR_HEIGHT_DEFAULT = 20;
     private static final int PLACEMENT_COOLDOWN_TICKS = 4;
+
+    private double reachDistance = VANILLA_REACH_DISTANCE;
     
     public void start(BlockPos pos1, BlockPos pos2) {
         blocksToMine.clear();
+        deferredBlocks.clear();
+        miningDeferredBlocks = false;
         currentBlockIndex = 0;
         
         // Store start position - mining will proceed FROM pos1 TOWARDS pos2
@@ -182,10 +189,20 @@ public class MiningController {
         rotationTicks = 0;
         findNextBlock(MinecraftClient.getInstance());
     }
+
+    public void setExtendedReach(boolean enabled) {
+        reachDistance = enabled ? EXTENDED_REACH_DISTANCE : VANILLA_REACH_DISTANCE;
+    }
+
+    public double getReachDistance() {
+        return reachDistance;
+    }
     
     public void stop() {
         state = State.IDLE;
         blocksToMine.clear();
+        deferredBlocks.clear();
+        miningDeferredBlocks = false;
         currentBlockIndex = 0;
         currentTarget = null;
         queueTarget = null;
@@ -257,6 +274,14 @@ public class MiningController {
         // Find the next valid block from the queue
         while (currentBlockIndex < blocksToMine.size()) {
             BlockPos pos = blocksToMine.get(currentBlockIndex);
+
+            // Defer mining of scaffold blocks we placed ourselves
+            if (!miningDeferredBlocks && placedBlocks.contains(pos)) {
+                deferredBlocks.add(pos);
+                currentBlockIndex++;
+                continue;
+            }
+
             BlockState blockState = client.world.getBlockState(pos);
             
             // Skip air and unbreakable blocks
@@ -270,8 +295,23 @@ public class MiningController {
             }
             currentBlockIndex++;
         }
+
+        // If we deferred blocks, mine them after all normal blocks are done
+        if (!deferredBlocks.isEmpty()) {
+            blocksToMine = deferredBlocks;
+            deferredBlocks = new ArrayList<>();
+            currentBlockIndex = 0;
+            miningDeferredBlocks = true;
+            findNextBlock(client);
+            return;
+        }
         
         // All done
+        if (!placedBlocks.isEmpty()) {
+            state = State.CLEANUP_SCAFFOLD;
+            showActionBarMessage(client, "§bCleaning scaffold...");
+            return;
+        }
         stop();
         showActionBarMessage(client, "§aMining complete!");
     }
@@ -338,13 +378,13 @@ public class MiningController {
         if (Math.abs(player.getPitch()) > 30) {
             player.setPitch(player.getPitch() * 0.9f);  // Gradually level out
         }
-        player.setSprinting(false);
+        player.setSprinting(true);
         
         // Check if we need to jump
         boolean shouldJump = shouldJump(client, player, yaw);
         
         // Simulate forward movement
-        double speed = 0.13;
+        double speed = player.isSprinting() ? 0.2 : 0.13;
         double motionX = -Math.sin(Math.toRadians(yaw)) * speed;
         double motionZ = Math.cos(Math.toRadians(yaw)) * speed;
         
@@ -405,7 +445,7 @@ public class MiningController {
             BlockState state = world.getBlockState(queueTarget);
             if (!state.isAir() && state.getHardness(world, queueTarget) >= 0) {
                 double dist = playerEyes.distanceTo(Vec3d.ofCenter(queueTarget));
-                if (dist <= REACH_DISTANCE) {
+                if (dist <= reachDistance) {
                     closest = queueTarget;
                     closestDist = dist;
                 }
@@ -429,7 +469,7 @@ public class MiningController {
                     BlockState blockState = world.getBlockState(checkPos);
                     if (!blockState.isAir() && blockState.getHardness(world, checkPos) >= 0) {
                         double dist = playerEyes.distanceTo(Vec3d.ofCenter(checkPos));
-                        if (dist <= REACH_DISTANCE && dist < closestDist) {
+                        if (dist <= reachDistance && dist < closestDist) {
                             closest = checkPos;
                             closestDist = dist;
                         }
@@ -520,7 +560,7 @@ public class MiningController {
         double distance = playerEyes.distanceTo(targetCenter);
         
         // Check if target is now within reach
-        if (distance <= REACH_DISTANCE) {
+        if (distance <= reachDistance) {
             showActionBarMessage(client, "§aDone pillaring, target reachable!");
             // Go directly to finding the block, skip movement phase
             BlockPos closestBlock = findClosestReachableBlock(client, player);
@@ -636,7 +676,7 @@ public class MiningController {
         double distance = player.getEyePos().distanceTo(targetCenter);
         
         // Check if we can now reach the target
-        if (distance <= REACH_DISTANCE && canSeeBlock(client, queueTarget)) {
+        if (distance <= reachDistance && canSeeBlock(client, queueTarget)) {
             state = State.MOVING;
             player.setSneaking(false);
             bridgeTarget = null;
@@ -925,7 +965,7 @@ public class MiningController {
         
         // Simple distance check - more sophisticated raycast could be added
         double dist = eyePos.distanceTo(targetCenter);
-        return dist <= REACH_DISTANCE + 0.5;
+        return dist <= reachDistance + 0.5;
     }
     
     private void handleRotating(MinecraftClient client) {
@@ -1073,7 +1113,11 @@ public class MiningController {
         if (waitTicks <= 0) {
             // DON'T clean up scaffold immediately - keep it for subsequent blocks
             // Only clean up when mining is done or player moves far away
-            state = State.IDLE;
+            if (shouldCleanupScaffold(client)) {
+                state = State.CLEANUP_SCAFFOLD;
+            } else {
+                state = State.IDLE;
+            }
         }
     }
     
@@ -1091,7 +1135,7 @@ public class MiningController {
         // Check if we're standing on a scaffold block or there's one nearby we can reach
         for (BlockPos placed : placedBlocks) {
             double dist = player.getEyePos().distanceTo(Vec3d.ofCenter(placed));
-            if (dist <= REACH_DISTANCE) {
+            if (dist <= reachDistance) {
                 return true;
             }
         }
@@ -1122,7 +1166,7 @@ public class MiningController {
             }
             
             double dist = playerEyes.distanceTo(Vec3d.ofCenter(placed));
-            if (dist <= REACH_DISTANCE && dist < closestDist) {
+            if (dist <= reachDistance && dist < closestDist) {
                 closest = placed;
                 closestDist = dist;
             }
@@ -1131,7 +1175,8 @@ public class MiningController {
         if (closest == null) {
             // No reachable scaffold blocks - done cleaning or need to move
             if (placedBlocks.isEmpty()) {
-                state = State.IDLE;
+                stop();
+                showActionBarMessage(client, "§aMining complete!");
             } else {
                 // Can't reach remaining blocks, just continue mining
                 state = State.IDLE;
@@ -1142,6 +1187,8 @@ public class MiningController {
         // Mine the scaffold block
         currentTarget = closest;
         targetLocked = true;
+
+        selectBestTool(client, client.world.getBlockState(closest));
         
         // Look at it
         calculateTargetRotation(client);
@@ -1159,6 +1206,10 @@ public class MiningController {
             currentTarget = null;
             targetLocked = false;
             showActionBarMessage(client, "§aScaffold cleaned: " + placedBlocks.size() + " remaining");
+            if (placedBlocks.isEmpty()) {
+                stop();
+                showActionBarMessage(client, "§aMining complete!");
+            }
         }
     }
     
